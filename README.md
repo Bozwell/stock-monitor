@@ -106,7 +106,7 @@ hardware spec : 1GHz quad-core 64-bit ARM Cortex-A53 CPU and 512MB RAM.
 config/.env.example 를 .env 로 복사하여 필요한 정보를 채워줍니다.
 모니터링 하고자 하는 종목은  stocks.json에 저장되어 있습니다. 필요시 편집.
 ```
-git clone {GIT_REPO}
+git clone https://github.com/Bozwell/stock-monitor
 cd stock-monitor/app
 cp config/.env.example config/.env
 cp config/token.json.example config/token.json
