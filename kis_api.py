@@ -1,17 +1,51 @@
 import os
 import json
-from datetime import datetime, timedelta
+import logging
 import requests
 from dotenv import load_dotenv
-import logging
-import sys
+from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s [%(levelname)s] %(message)s',
-                    handlers=[logging.StreamHandler(sys.stdout)])
+from tinydb import TinyDB
+
+from rich.logging import RichHandler
+from rich.console import Console
+from rich.theme import Theme
+
+
+# 커스터마이징 
+custom_theme = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "red",
+    "critical": "red reverse"
+})
+
+console = Console(theme=custom_theme)
+rich_handler = RichHandler(
+    console=console,
+    rich_tracebacks=True,
+    tracebacks_show_locals=True,
+    show_time=True,
+    show_path=False
+)
+
+# 기본 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",  
+    datefmt="[%X]",
+    handlers=[rich_handler]
+)
+
+# 로거 가져오기
 logger = logging.getLogger(__name__)
 
+# config 디렉토리의 .env 파일 로드
 load_dotenv(os.path.join(os.getenv('CONFIG_DIR', 'config'), '.env'))
+
+# TinyDB
+db_path = os.path.join(os.getenv('CONFIG_DIR', 'config'), 'db.json')
+db = TinyDB(db_path)
 
 APP_KEY = os.getenv('APP_KEY')
 APP_SECRET = os.getenv('APP_SECRET')
@@ -21,14 +55,15 @@ URL_BASE = "https://openapi.koreainvestment.com:9443"
 
 # -------------------------------------------------
 def load_token():
-    """ API Token 을 가져온다. """
+    # 테스트 환경에서는 항상 None 반환
+    if os.getenv('CONFIG_DIR') == 'test_config':
+        return None
+        
     try:
-        token_path = os.path.join(os.getenv('CONFIG_DIR', 'config'),
-                                  'token.json')
-        with open(token_path, 'r') as f:
-            token_data = json.load(f)
+        token_table = db.table('token')
+        token_data = token_table.all()[-1] if token_table.all() else None
 
-        if token_data['issued_time'] == "" or token_data['access_token'] == "":
+        if not token_data or token_data['issued_time'] == "" or token_data['access_token'] == "":
             return None
 
         issued_time = datetime.fromisoformat(token_data['issued_time'])
@@ -37,30 +72,32 @@ def load_token():
         if current_time - issued_time < timedelta(hours=23):
             return token_data['access_token']
         return None
-    except (FileNotFoundError, KeyError, json.JSONDecodeError):
+    except (KeyError, json.JSONDecodeError):
         return None
 
 
 # -------------------------------------------------
 def save_token(access_token):
-    """ API Token 을 저장한다. """
     token_data = {
         'access_token': access_token,
         'issued_time': datetime.now().isoformat()
     }
-    token_path = os.path.join(os.getenv('CONFIG_DIR', 'config'), 'token.json')
-    with open(token_path, 'w') as f:
-        json.dump(token_data, f)
+    
+    # 테스트 환경에서는 직접 TinyDB 인스턴스를 생성
+    if os.getenv('CONFIG_DIR') == 'test_config':
+        test_db = TinyDB(os.path.join('test_config', 'db.json'))
+        token_table = test_db.table('token')
+        token_table.insert(token_data)
+        test_db.close()
+    else:
+        token_table = db.table('token')
+        token_table.insert(token_data)
+    
     logger.info("새로운 토큰이 저장되었습니다.")
 
 
 # -------------------------------------------------
 def auth():
-    """
-        access_token을 발급받는다.
-        한국투자증권 API access token은 24시간 유효한 토큰임.  
-    """
-
     PATH = "oauth2/tokenP"
     URL = f"{URL_BASE}/{PATH}"
 
@@ -82,8 +119,6 @@ def auth():
 
 # -------------------------------------------------
 def get_current_price(stock_no, stock_name):
-    """ 주식 가격정보를 가져온다. """
-
     ACCESS_TOKEN = load_token()
     if ACCESS_TOKEN == None:
         auth()
@@ -100,31 +135,32 @@ def get_current_price(stock_no, stock_name):
         "tr_id": "FHKST01010100"
     }
 
-    params = {"fid_cond_mrkt_div_code": "J", "fid_input_iscd": stock_no}
+    params = {
+        "FID_COND_MRKT_DIV_CODE": "J",
+        "FID_INPUT_ISCD": stock_no
+    }
 
     res = requests.get(URL, headers=headers, params=params)
 
-    if res.status_code == 200 and res.json()["rt_cd"] == "0":
-        data = res.json()["output"]
-        result = {
-            "stock_code": data["stck_shrn_iscd"],  # 종목코드
-            "stock_name": stock_name,  # 종목명
-            "current_price": int(data["stck_prpr"]),  # 현재가
-            "price_diff": int(data["prdy_vrss"]),  # 전일대비
-            "change_rate": float(data["prdy_ctrt"]),  # 등락률
-            "volume": int(data["acml_vol"]),  # 거래량
-            "trading_value": int(data["acml_tr_pbmn"]),  # 거래대금
-            "opening_price": int(data["stck_oprc"]),  # 시가
-            "high_price": int(data["stck_hgpr"]),  # 고가
-            "low_price": int(data["stck_lwpr"]),  # 저가
-        }
-        return result
-
-    # res.status_code == 500 경우도 있어 아래와 같이 수정함.
-    # 기존 코드 : res.status_code == 200 and res.json()["msg_cd"] == "EGW00123":
-    elif res.json()["msg_cd"] == "EGW00123":
-        auth()
-        return get_current_price(stock_no)
+    if res.status_code == 200:
+        data = res.json()
+        if data['rt_cd'] == '0':
+            output = data['output']
+            return {
+                'stock_code': output['stck_shrn_iscd'],
+                'stock_name': stock_name,
+                'current_price': int(output['stck_prpr']),
+                'price_diff': int(output['prdy_vrss']),
+                'change_rate': float(output['prdy_ctrt']),
+                'volume': int(output['acml_vol']),
+                'trading_value': int(output['acml_tr_pbmn']),
+                'open_price': int(output['stck_oprc']),
+                'high_price': int(output['stck_hgpr']),
+                'low_price': int(output['stck_lwpr'])
+            }
+        else:
+            logger.error(f"Error Code : {data['rt_cd']} | {data['msg_cd']} | {data['msg1']}")
+            return None
     else:
         logger.error("Error Code : " + str(res.status_code) + " | " + res.text)
         return None
@@ -133,6 +169,7 @@ def get_current_price(stock_no, stock_name):
 # -------------------------------------------------
 if __name__ == "__main__":
     result = get_current_price("012450", "한화에어로스페이스")
+    print(type(result.get("change_rate")))
 
     if result:
         for key, value in result.items():

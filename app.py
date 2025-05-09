@@ -1,73 +1,78 @@
-import current_price
-from influxdb_client import InfluxDBClient, Point
 import os
+import logging
+
+import pytz
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime
-import pytz
-from current_price import get_current_price
-import json
+from influxdb_client import InfluxDBClient, Point
 from time import sleep
-import logging
-import sys
+from tinydb import TinyDB
+from kis_api import get_current_price
+from utils import load_stocks, check_krx_market_time
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s [%(levelname)s] %(message)s',
-                    handlers=[logging.StreamHandler(sys.stdout)])
+from rich.logging import RichHandler
+from rich.console import Console
+from rich.theme import Theme
+
+
+# 커스터마이징 
+custom_theme = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "red",
+    "critical": "red reverse"
+})
+
+console = Console(theme=custom_theme)
+rich_handler = RichHandler(
+    console=console,
+    rich_tracebacks=True,
+    tracebacks_show_locals=True,
+    show_time=True,
+    show_path=False
+)
+
+# 기본 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[rich_handler]
+)
+
+# 로거 가져오기
 logger = logging.getLogger(__name__)
 
+# APScheduler 로거 설정
+apscheduler_logger = logging.getLogger('apscheduler')
+apscheduler_logger.setLevel(logging.ERROR)
+apscheduler_logger.handlers = []  # 기존 핸들러 제거
+apscheduler_logger.addHandler(rich_handler)
+
+# .env 파일 로드
 load_dotenv(os.path.join(os.getenv('CONFIG_DIR', 'config'), '.env'))
 
+# TinyDB
+db_path = os.path.join(os.getenv('CONFIG_DIR', 'config'), 'db.json')
+db = TinyDB(db_path)
 
-# -------------------------------------------------
-def load_stocks():
-    """ 시세를 조회할 종목 정보를 가져온다. """
-
-    stocks_path = os.path.join(os.getenv('CONFIG_DIR', 'config'),
-                               'stocks.json')
-    with open(stocks_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
-# -------------------------------------------------
-def check_krx_market_time():
-    """ 한국장 시간인지 체크 """
-
-    # 한국 시간대 설정
-    korea_tz = pytz.timezone('Asia/Seoul')
-    current_time = datetime.now(korea_tz)
-
-    # 주중인지 확인 (0 = 월요일, 6 = 일요일)
-    if current_time.weekday() >= 5:  # 주말이면 실행하지 않음
-        return False
-
-    # 시간이 9:00 ~ 15:30 사이인지 확인
-    market_start = current_time.replace(hour=9,
-                                        minute=0,
-                                        second=0,
-                                        microsecond=0)
-    market_end = current_time.replace(hour=15,
-                                      minute=30,
-                                      second=0,
-                                      microsecond=0)
-
-    return market_start <= current_time <= market_end
 
 
 # -------------------------------------------------
 def main():
-    """ 주식시세 조회 메인 함수 """
-
     if not check_krx_market_time():
         logger.info("장 운영 시간이 아닙니다.")
         return
 
+    logger.info("-------------------------------------------------")
     try:
         stock_list = load_stocks()
         logger.info(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 주식 시세 조회 시작")
 
+        # InfluxDB 클라이언트 설정
         client = InfluxDBClient(url=os.getenv('INFLUXDB_URL'),
                                 token=os.getenv('INFLUXDB_TOKEN'),
                                 org=os.getenv('INFLUXDB_ORG'))
@@ -76,12 +81,12 @@ def main():
         for stock in stock_list:
             try:
                 result = get_current_price(stock['code'], stock['name'])
-                sleep(0.5)  # ratelimit 대응 딜레이
+                sleep(0.2)  #초당 거래건수 대응 딜레이
 
                 if result:
                     logger.info(
-                        f"{stock['name']} ({stock['code']}) 시세 저장 중...")
-
+                        f"종목명: {stock['name']}, 종목코드: {stock['code']} 시세 저장 중...")
+                    # InfluxDB에 데이터 저장
                     point = Point("stock_price") \
                         .tag("code", stock['code']) \
                         .tag("name", stock['name'])
@@ -92,16 +97,23 @@ def main():
 
                     write_api.write(bucket=os.getenv('INFLUXDB_BUCKET'),
                                     record=point)
+                    change_rate = result.get("change_rate", 0)
                     logger.info(
-                        f"{stock['name']}, 현재가:{result['current_price']} 데이터 저장 완료"
+                        f"종목명: {stock['name']}, 현재가:{result['current_price']}원, 등락률: {change_rate}%  데이터 저장 완료"
                     )
             except Exception as e:
                 logger.error(f"Error checking {stock['name']}: {str(e)}")
 
+        write_api.close()
         client.close()
 
     except Exception as e:
-        logger.error(f"Error in main function: {str(e)}")
+        logger.error(f"Error in main function: {str(e)}")   
+    finally:
+        if write_api:
+            write_api.close()
+        if client:
+            client.close()
 
 
 # -------------------------------------------------
@@ -112,7 +124,7 @@ if __name__ == "__main__":
     trigger = CronTrigger(
         day_of_week='mon-fri',  # 월요일부터 금요일까지
         hour='9-15',  # 9시부터 15시까지
-        minute='*/10',  # 10분마다
+        minute='*/1',  # 1분마다
         timezone=pytz.timezone('Asia/Seoul'))
 
     scheduler.add_job(main, trigger=trigger)
